@@ -3,6 +3,78 @@ import torch.nn as nn
 import torch.nn.functional as F
 from time import time
 import numpy as np
+from pointmax_utils import *
+from torch_scatter import scatter_sum
+import pointnet2_ops._ext as _ext
+from torch.autograd import Function
+class FurthestPointSampling(Function):
+    @staticmethod
+    def forward(ctx, xyz, npoint):
+        # type: (Any, torch.Tensor, int) -> torch.Tensor
+        r"""
+        Uses iterative furthest point sampling to select a set of npoint features that have the largest
+        minimum distance
+
+        Parameters
+        ----------
+        xyz : torch.Tensor
+            (B, N, 3) tensor where N > npoint
+        npoint : int32
+            number of features in the sampled set
+
+        Returns
+        -------
+        torch.Tensor
+            (B, npoint) tensor containing the set
+        """
+        out = _ext.furthest_point_sampling(xyz, npoint)
+
+        ctx.mark_non_differentiable(out)
+
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        return ()
+
+
+furthest_point_sample = FurthestPointSampling.apply
+
+
+class BallQuery(Function):
+    @staticmethod
+    def forward(ctx, radius, nsample, xyz, new_xyz):
+        # type: (Any, float, int, torch.Tensor, torch.Tensor) -> torch.Tensor
+        r"""
+
+        Parameters
+        ----------
+        radius : float
+            radius of the balls
+        nsample : int
+            maximum number of features in the balls
+        xyz : torch.Tensor
+            (B, N, 3) xyz coordinates of the features
+        new_xyz : torch.Tensor
+            (B, npoint, 3) centers of the ball query
+
+        Returns
+        -------
+        torch.Tensor
+            (B, npoint, nsample) tensor with the indicies of the features that form the query balls
+        """
+        output = _ext.ball_query(new_xyz, xyz, radius, nsample)
+
+        ctx.mark_non_differentiable(output)
+
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        return ()
+
+
+ball_query = BallQuery.apply
 
 def timeit(tag, t):
     print("{}: {}s".format(tag, time() - t))
@@ -121,9 +193,13 @@ def sample_and_group(npoint, radius, nsample, xyz, points, returnfps=False):
     """
     B, N, C = xyz.shape
     S = npoint
-    fps_idx = farthest_point_sample(xyz, npoint) # [B, npoint, C]
+    fps_idx = furthest_point_sample(xyz, npoint).long() # [B, npoint, C]
     new_xyz = index_points(xyz, fps_idx)
-    idx = query_ball_point(radius, nsample, xyz, new_xyz)
+    if points is not None:
+        fps_points=index_points(points,fps_idx)
+    else:
+        fps_points=new_xyz
+    idx = ball_query(radius, nsample, xyz, new_xyz).long()
     grouped_xyz = index_points(xyz, idx) # [B, npoint, nsample, C]
     grouped_xyz_norm = grouped_xyz - new_xyz.view(B, S, 1, C)
 
@@ -135,7 +211,7 @@ def sample_and_group(npoint, radius, nsample, xyz, points, returnfps=False):
     if returnfps:
         return new_xyz, new_points, grouped_xyz, fps_idx
     else:
-        return new_xyz, new_points
+        return new_xyz, new_points,grouped_xyz_norm,fps_points
 
 
 def sample_and_group_all(xyz, points):
@@ -158,8 +234,55 @@ def sample_and_group_all(xyz, points):
     return new_xyz, new_points
 
 
+class Task_Branch(nn.Module):
+    def __init__(self, npoint, radius, nsample, in_channel, mlp):
+        super(Task_Branch, self).__init__()
+        self.npoint = npoint
+        self.radius = radius
+        self.nsample = nsample
+        self.mlp_convs = nn.ModuleList()
+        self.mlp_bns = nn.ModuleList()
+        last_channel = in_channel
+        for out_channel in mlp:
+            self.mlp_convs.append(nn.Conv2d(last_channel, out_channel, 1))
+            self.mlp_bns.append(nn.BatchNorm2d(out_channel))
+            last_channel = out_channel
+        self.fc=nn.Sequential(nn.Linear(out_channel,out_channel//4),nn.BatchNorm1d(out_channel//4),nn.ReLU(),nn.Dropout(0.2),nn.Linear(out_channel//4,15))
+        self.criterion=nn.CrossEntropyLoss()
+    def forward(self, new_points,label):
+        """
+        Input:
+            xyz: input points position data, [B, C, N]
+            points: input points data, [B, D, N]
+        Return:
+            new_xyz: sampled points position data, [B, C, S]
+            new_points_concat: sample points feature data, [B, D', S]
+        """
+        for i, conv in enumerate(self.mlp_convs):
+            bn = self.mlp_bns[i]
+            new_points =  F.relu(bn(conv(new_points)))
+
+        
+        B,C,N,K=new_points.shape
+        with torch.no_grad():
+            score_f=new_points.permute(0,2,1,3).contiguous().argmax(dim=-1).view(-1,C)
+            score_f=scatter_sum(torch.ones_like(score_f).float().to(score_f.device),index=score_f,out=torch.zeros(score_f.shape[0],K).to(score_f.device).float())
+            score=score_f/torch.max(score_f,dim=-1,keepdim=True).values
+            score=score.view(B,N,K)
+      
+
+
+
+        new_points = torch.max(new_points, 2)[0]
+        cls_f_max=torch.max(new_points,dim=-1).values
+        cls_f=cls_f_max
+        cls_predict=self.fc(cls_f)
+        loss=self.criterion(cls_predict,label)
+
+        return score,loss
+    
 class PointNetSetAbstraction(nn.Module):
-    def __init__(self, npoint, radius, nsample, in_channel, mlp, group_all):
+    def __init__(self, npoint, radius, nsample, in_channel, mlp, group_all,pointmax=False):
         super(PointNetSetAbstraction, self).__init__()
         self.npoint = npoint
         self.radius = radius
@@ -172,8 +295,12 @@ class PointNetSetAbstraction(nn.Module):
             self.mlp_bns.append(nn.BatchNorm2d(out_channel))
             last_channel = out_channel
         self.group_all = group_all
+        self.pointmax=pointmax
+        if pointmax:
+            self.tob=Task_Branch(npoint,radius,nsample,in_channel,mlp=mlp)
+            self.pointmax_predict=ConditionMLP(in_channel-3,32)
 
-    def forward(self, xyz, points):
+    def forward(self, xyz, points,label):
         """
         Input:
             xyz: input points position data, [B, C, N]
@@ -189,17 +316,40 @@ class PointNetSetAbstraction(nn.Module):
         if self.group_all:
             new_xyz, new_points = sample_and_group_all(xyz, points)
         else:
-            new_xyz, new_points = sample_and_group(self.npoint, self.radius, self.nsample, xyz, points)
+            new_xyz, new_points,group_xyz,fps_points = sample_and_group(self.npoint, self.radius, self.nsample, xyz, points)
+            group_xyz=group_xyz.permute(0,3,1,2)
         # new_xyz: sampled points position data, [B, npoint, C]
         # new_points: sampled points data, [B, npoint, nsample, C+D]
-        new_points = new_points.permute(0, 3, 2, 1) # [B, C+D, nsample,npoint]
+        new_points = new_points.permute(0, 3, 1, 2) # [B, C+D, nsample,npoint]
+       
+        
+        B,C,N,K=new_points.shape
+        loss=0
+        if self.pointmax:
+            
+            
+            pointmax_predict=self.pointmax_predict(group_xyz,new_xyz,fps_points.permute(0,2,1).contiguous())
+            if self.training:
+                pointmax_score,pointmax_loss=self.tob(new_points,label)
+                loss=F.mse_loss(pointmax_predict,pointmax_score.clone().detach())
+                loss=loss+pointmax_loss
+            pointmax_index=torch.argsort(pointmax_predict,dim=-1,descending=True)[:,:,:int(K*0.7)]
+            new_points=new_points.gather(dim=3,index=pointmax_index.unsqueeze(1).repeat(1,C,1,1))
+            score_predict=pointmax_predict.gather(dim=-1,index=pointmax_index).unsqueeze(1)
+        
         for i, conv in enumerate(self.mlp_convs):
             bn = self.mlp_bns[i]
             new_points =  F.relu(bn(conv(new_points)))
-
-        new_points = torch.max(new_points, 2)[0]
+       
+        if self.pointmax:
+            weight=F.sigmoid(score_predict)
+            
+            new_points=new_points*(weight)
+  
+        new_points = torch.max(new_points, -1)[0]
+       
         new_xyz = new_xyz.permute(0, 2, 1)
-        return new_xyz, new_points
+        return new_xyz, new_points,loss
 
 
 class PointNetSetAbstractionMsg(nn.Module):

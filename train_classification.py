@@ -18,7 +18,7 @@ import argparse
 from pathlib import Path
 from tqdm import tqdm
 from data_utils.ModelNetDataLoader import ModelNetDataLoader
-
+from data_utils.ScanObjectNN import ScanObjectNNDataLoader
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = BASE_DIR
 sys.path.append(os.path.join(ROOT_DIR, 'models'))
@@ -30,7 +30,7 @@ def parse_args():
     parser.add_argument('--gpu', type=str, default='0', help='specify gpu device')
     parser.add_argument('--batch_size', type=int, default=24, help='batch size in training')
     parser.add_argument('--model', default='pointnet_cls', help='model name [default: pointnet_cls]')
-    parser.add_argument('--num_category', default=40, type=int, choices=[10, 40],  help='training on ModelNet10/40')
+    parser.add_argument('--num_category', default=15, type=int, choices=[10, 40],  help='training on ModelNet10/40')
     parser.add_argument('--epoch', default=200, type=int, help='number of epoch in training')
     parser.add_argument('--learning_rate', default=0.001, type=float, help='learning rate in training')
     parser.add_argument('--num_point', type=int, default=1024, help='Point Number')
@@ -60,7 +60,7 @@ def test(model, loader, num_class=40):
             points, target = points.cuda(), target.cuda()
 
         points = points.transpose(2, 1)
-        pred, _ = classifier(points)
+        pred, _ ,_= classifier(points,target)
         pred_choice = pred.data.max(1)[1]
 
         for cat in np.unique(target.cpu()):
@@ -84,7 +84,7 @@ def main(args):
         print(str)
 
     '''HYPER PARAMETER'''
-    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
+    # os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
 
     '''CREATE DIR'''
     timestr = str(datetime.datetime.now().strftime('%Y-%m-%d_%H-%M'))
@@ -118,8 +118,8 @@ def main(args):
     log_string('Load dataset ...')
     data_path = 'data/modelnet40_normal_resampled/'
 
-    train_dataset = ModelNetDataLoader(root=data_path, args=args, split='train', process_data=args.process_data)
-    test_dataset = ModelNetDataLoader(root=data_path, args=args, split='test', process_data=args.process_data)
+    train_dataset = ScanObjectNNDataLoader(root=data_path, args=args, split='train', process_data=args.process_data)
+    test_dataset = ScanObjectNNDataLoader(root=data_path, args=args, split='test', process_data=args.process_data)
     trainDataLoader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=10, drop_last=True)
     testDataLoader = torch.utils.data.DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=10)
 
@@ -185,8 +185,9 @@ def main(args):
             if not args.use_cpu:
                 points, target = points.cuda(), target.cuda()
 
-            pred, trans_feat = classifier(points)
+            pred, trans_feat,pointmax_loss = classifier(points,target)
             loss = criterion(pred, target.long(), trans_feat)
+            loss=loss+pointmax_loss
             pred_choice = pred.data.max(1)[1]
 
             correct = pred_choice.eq(target.long().data).cpu().sum()

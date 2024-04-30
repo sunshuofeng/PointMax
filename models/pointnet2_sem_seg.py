@@ -2,14 +2,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from models.pointnet2_utils import PointNetSetAbstraction,PointNetFeaturePropagation
 
-
+from collections import defaultdict
 class get_model(nn.Module):
     def __init__(self, num_classes):
         super(get_model, self).__init__()
         self.sa1 = PointNetSetAbstraction(1024, 0.1, 32, 9 + 3, [32, 32, 64], False)
-        self.sa2 = PointNetSetAbstraction(256, 0.2, 32, 64 + 3, [64, 64, 128], False)
-        self.sa3 = PointNetSetAbstraction(64, 0.4, 32, 128 + 3, [128, 128, 256], False)
-        self.sa4 = PointNetSetAbstraction(16, 0.8, 32, 256 + 3, [256, 256, 512], False)
+        self.sa2 = PointNetSetAbstraction(256, 0.18, 32, 64 + 3, [64, 64, 128], False)
+        self.sa3 = PointNetSetAbstraction(64, 0.32, 32, 128 + 3, [128, 128, 256], False)
+        self.sa4 = PointNetSetAbstraction(18, 0.58, 32, 256 + 3, [256, 256, 512], False)
         self.fp4 = PointNetFeaturePropagation(768, [256, 256])
         self.fp3 = PointNetFeaturePropagation(384, [256, 256])
         self.fp2 = PointNetFeaturePropagation(320, [256, 128])
@@ -22,11 +22,15 @@ class get_model(nn.Module):
     def forward(self, xyz):
         l0_points = xyz
         l0_xyz = xyz[:,:3,:]
-
-        l1_xyz, l1_points = self.sa1(l0_xyz, l0_points)
-        l2_xyz, l2_points = self.sa2(l1_xyz, l1_points)
-        l3_xyz, l3_points = self.sa3(l2_xyz, l2_points)
-        l4_xyz, l4_points = self.sa4(l3_xyz, l3_points)
+        layer_sigma=defaultdict(int)
+        l1_xyz, l1_points,sigma = self.sa1(l0_xyz, l0_points)
+        layer_sigma['layer1']+=sigma
+        l2_xyz, l2_points,sigma = self.sa2(l1_xyz, l1_points)
+        layer_sigma['layer2']+=sigma
+        l3_xyz, l3_points,sigma = self.sa3(l2_xyz, l2_points)
+        layer_sigma['layer3']+=sigma
+        l4_xyz, l4_points,sigma = self.sa4(l3_xyz, l3_points)
+        layer_sigma['layer4']+=sigma
 
         l3_points = self.fp4(l3_xyz, l4_xyz, l3_points, l4_points)
         l2_points = self.fp3(l2_xyz, l3_xyz, l2_points, l3_points)
@@ -37,7 +41,7 @@ class get_model(nn.Module):
         x = self.conv2(x)
         x = F.log_softmax(x, dim=1)
         x = x.permute(0, 2, 1)
-        return x, l4_points
+        return x, l4_points,layer_sigma
 
 
 class get_loss(nn.Module):
